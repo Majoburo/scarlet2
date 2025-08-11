@@ -6,20 +6,23 @@
 """Plotting functions"""
 
 from abc import ABC, abstractmethod
+import copy
 
 import jax
 import jax.numpy as jnp
 import jax.random as random
+from jax import grad, jit, jvp
+import numpy as np
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
-import numpy as np
-from jax import grad, jit, jvp
+from matplotlib.colors import Normalize
 from matplotlib.patches import Polygon, Rectangle
+import corner
 
 from . import measure
 from .bbox import Box
 from .renderer import ChannelRenderer
-
+from .morphology import GaussianMorphology
 
 def channels_to_rgb(channels):
     """Get the linear mapping of multiple channels to RGB channels
@@ -1064,3 +1067,518 @@ def scene(
 
     except NameError:
         return fig
+
+
+def mcmc_scene(obs, scene, samples, vmin=None, vmax=None, figsize=(15,5)):
+    """
+    Plot data, posterior‐mean model, and residual for one channel,
+    overlaying source centers from the MCMC chains.
+
+    Parameters
+    ----------
+    obs : scarlet2.Observation
+        Your observation object (contains data & PSF).
+    scene : scarlet2.Scene
+        The original Scene you passed to `scene.sample`.
+    samples : numpyro.infer.MCMC
+        The MCMC samples.
+    channel : int
+        Which band/channel to display.
+    vmin, vmax : floats, optional
+        Color limits for data & model.
+    figsize : tuple
+        Figure size.
+    """
+
+    # 1) Copy the scene so we don't clobber your originals
+    post_scene = copy.deepcopy(scene)
+
+    # 2) For each source, assign the posterior‐mean parameters
+    for i, src in enumerate(post_scene.sources):
+        # center
+        key_c = f"center:{i}"
+        if key_c in samples:
+            mean_c = jnp.mean(samples[key_c], axis=0)
+            src.center = tuple(map(float, mean_c))
+        # spectrum
+        key_s = f"spectrum:{i}"
+        if key_s in samples:
+            mean_s = jnp.mean(samples[key_s], axis=0)
+            src.spectrum = mean_s
+        # morphology *array* (if you sampled it)
+        key_m = f"morph:{i}"
+        if key_m in samples:
+            mean_m = jnp.mean(samples[key_m], axis=0)
+            src.morphology = mean_m
+        # ellipticity & size (for parametric morphologies)
+        key_e = f"ellipticity:{i}"
+        if key_e in samples:
+            mean_e = jnp.mean(samples[key_e], axis=0)
+            src.morphology.ellipticity = mean_e
+        key_sz = f"size:{i}"
+        if key_sz in samples:
+            mean_sz = float(jnp.mean(samples[key_sz], axis=0))
+            src.morphology.size = mean_sz
+
+    # 3) Render the model
+    model = obs.render(post_scene())
+    # use only unmasked pixels
+    n = jnp.prod(jnp.asarray(obs.data.shape)) - jnp.sum(obs.weights == 0)
+    resid = (obs.weights * (obs.data - model) ** 2).sum(axis=0) / n
+
+    # 4) Plot
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+    im0 = axes[0].imshow(jnp.mean(obs.data,axis=0), origin="lower", vmin=vmin, vmax=vmax)
+    axes[0].set_title("Data")
+    im1 = axes[1].imshow(jnp.mean(model,axis=0), origin="lower", vmin=vmin, vmax=vmax)
+    axes[1].set_title("Model (posterior mean)")
+    im2 = axes[2].imshow(resid, origin="lower", cmap="RdBu_r")
+    axes[2].set_title("Residual fraction")
+
+    # Colorbars
+    fig.colorbar(im0, ax=axes[0], fraction=0.046)
+    fig.colorbar(im1, ax=axes[1], fraction=0.046)
+    fig.colorbar(im2, ax=axes[2], fraction=0.046)
+
+    # Link zoom
+    for r in range(1,3):
+        axes[r].sharex(axes[0]); axes[r].sharey(axes[0])
+
+    plt.tight_layout()
+    plt.show()
+
+def _central_crop(arr2d, out_shape):
+    """Center-crop arr2d to out_shape=(H,W)."""
+    H, W = arr2d.shape
+    h, w = out_shape
+    y0 = (H - h) // 2
+    x0 = (W - w) // 2
+    return arr2d[y0:y0+h, x0:x0+w]
+
+def _shift2d_bilinear(img, dy, dx):
+    """Subpixel shift 2D image (bilinear). Positive dy/dx shift the image down/right."""
+    import numpy as _np
+    H, W = img.shape
+    y = _np.arange(H)[:, None]
+    x = _np.arange(W)[None, :]
+    y0 = _np.floor(y - dy).astype(int)
+    x0 = _np.floor(x - dx).astype(int)
+    wy = (y - dy) - y0
+    wx = (x - dx) - x0
+
+    def safe_get(a, yy, xx):
+        yy = _np.clip(yy, 0, H - 1)
+        xx = _np.clip(xx, 0, W - 1)
+        return a[yy, xx]
+
+    I00 = safe_get(img, y0,     x0)
+    I01 = safe_get(img, y0,     x0 + 1)
+    I10 = safe_get(img, y0 + 1, x0)
+    I11 = safe_get(img, y0 + 1, x0 + 1)
+
+    return (1 - wy) * ((1 - wx) * I00 + wx * I01) + wy * ((1 - wx) * I10 + wx * I11)
+
+
+# Helper to render a point-like source using the scene machinery
+def _render_point_like_patch(obs, scene, src_prototype, stamp_size, center=None):
+    """
+    Render a single point-like source (copy of `src_prototype`) into the observation frame,
+    using a unit spectrum, optionally at a different `center`, and return a cropped
+    (H, W) patch matching the source bbox size `stamp_size`.
+
+    This uses `scene.evaluate_source` + `obs.render` so PSF, pixel integration,
+    and WCS/frame transforms are handled consistently with the likelihood.
+    """
+    import copy as _copy
+    # copy source and set center / unit spectrum
+    src = _copy.deepcopy(src_prototype)
+    if center is not None:
+        src.center = tuple(map(float, center))
+    # unit spectrum so we're visualizing morphology-like shape
+    src.spectrum = np.ones(obs.frame.C, dtype=float)
+
+    # evaluate only this source to model frame, then render to obs frame
+    model_single = scene.evaluate_source(src)           # (C, Hm, Wm)
+    rendered     = obs.render(model_single)             # (C, Ho, Wo)
+    patch2d      = np.asarray(rendered).mean(axis=0)    # (Ho, Wo)
+
+    # crop around the source bbox of the **updated copy**; convert to obs-frame indices
+    H, W = stamp_size
+
+    # Use the bbox attached to the shifted copy (src), not the prototype
+    # Scene plotting utilities treat bbox corners as (x, y) when converting through WCS
+    start_xy_scene = np.array(src.bbox.spatial.start[::-1], dtype=float)  # (x0, y0) in scene frame
+    stop_xy_scene  = np.array(src.bbox.spatial.stop[::-1],  dtype=float)  # (x1, y1) in scene frame
+
+    # map to sky then to observation pixel coordinates (x, y)
+    start_xy_sky = scene.frame.get_sky_coord(start_xy_scene).flatten()
+    stop_xy_sky  = scene.frame.get_sky_coord(stop_xy_scene).flatten()
+    start_xy_obs = obs.frame.get_pixel(start_xy_sky).flatten()  # (x0_obs, y0_obs)
+    stop_xy_obs  = obs.frame.get_pixel(stop_xy_sky).flatten()   # (x1_obs, y1_obs)
+
+    # Ensure increasing order and convert to integer slice indices; for numpy slicing we need (y, x)
+    x0 = int(np.clip(np.floor(min(start_xy_obs[0], stop_xy_obs[0])), 0, patch2d.shape[1]))
+    x1 = int(np.clip(np.ceil( max(start_xy_obs[0], stop_xy_obs[0])),  0, patch2d.shape[1]))
+    y0 = int(np.clip(np.floor(min(start_xy_obs[1], stop_xy_obs[1])), 0, patch2d.shape[0]))
+    y1 = int(np.clip(np.ceil( max(start_xy_obs[1], stop_xy_obs[1])),  0, patch2d.shape[0]))
+
+    patch = patch2d[y0:y1, x0:x1]
+
+    # If shapes don't match due to rounding, pad/crop centrally to the requested stamp
+    if patch.shape != (H, W):
+        # center-crop or pad to (H,W)
+        ph, pw = patch.shape
+        # pad if smaller
+        pad_y = max(0, H - ph)
+        pad_x = max(0, W - pw)
+        if pad_y or pad_x:
+            patch = np.pad(patch, ((pad_y // 2, pad_y - pad_y // 2),
+                                   (pad_x // 2, pad_x - pad_x // 2)), mode="constant")
+        # then center-crop if larger
+        if patch.shape[0] > H or patch.shape[1] > W:
+            patch = _central_crop(patch, (H, W))
+
+    # Normalize to unit flux for morphology-like visualization
+    s = patch.sum()
+    if s > 0:
+        patch = patch / s
+    return patch
+
+# ---- mcmc_diagnostics helpers (factored) ----
+def _centroid(arr):
+    """Return (cy, cx) intensity-weighted centroid; fallback to image center if non-positive sum."""
+    arr = np.asarray(arr)
+    arr = arr - arr.min()
+    s = arr.sum()
+    if s <= 0:
+        h, w = arr.shape
+        return (h / 2.0, w / 2.0)
+    y_idx, x_idx = np.indices(arr.shape)
+    cy = float((y_idx * arr).sum() / s)
+    cx = float((x_idx * arr).sum() / s)
+    return (cy, cx)
+
+def _get_morph_stack(i, src, samples, obs, scene):
+    """Build a morphology stack for source i from samples: pixel, Gaussian, or point-like."""
+    key_m  = f"morph:{i}"
+    key_sz = f"size:{i}"
+    key_el = f"ellipticity:{i}"
+    key_c  = f"center:{i}"
+    H, W = src.bbox.shape[-2], src.bbox.shape[-1]
+    stamp_size = (H, W)
+    if key_m in samples:
+        return np.asarray(samples[key_m])
+    elif key_sz in samples and key_el in samples:
+        sz  = np.asarray(samples[key_sz])
+        ell = np.asarray(samples[key_el])
+        ms = [np.asarray(GaussianMorphology(size=float(sz[j]), ellipticity=ell[j], shape=stamp_size)())
+              for j in range(len(sz))]
+        return np.stack(ms, axis=0)
+    else:
+        if key_c in samples and len(samples[key_c]) > 0:
+            ctr = np.asarray(samples[key_c])
+            idx = np.linspace(0, len(ctr) - 1, len(ctr), dtype=int)
+            stack = []
+            for j in idx:
+                stack.append(_render_point_like_patch(obs, scene, src, stamp_size, center=ctr[j]))
+            return np.stack(stack, axis=0)
+
+def _align_morph_stack(morph_stack, i, samples):
+    """Optionally align samples to a common reference center to reduce averaging blur."""
+    if morph_stack.ndim != 3 or morph_stack.size == 0:
+        return morph_stack
+    key_c_this = f"center:{i}"
+    if  key_c_this in samples and len(samples[key_c_this]) > 0:
+        ref_c = np.asarray(samples[key_c_this]).mean(axis=0)  # (y,x)
+        cs = np.asarray(samples[key_c_this])
+        aligned = []
+        for img, c in zip(morph_stack, cs):
+            dy = float(ref_c[0] - c[0]); dx = float(ref_c[1] - c[1])
+            aligned.append(_shift2d_bilinear(img, dy, dx))
+        morph_stack = np.stack(aligned, axis=0)
+    else:
+        cents = np.array([_centroid(img) for img in morph_stack])
+        ref_cy, ref_cx = cents.mean(axis=0)
+        aligned = []
+        for img, (cy, cx) in zip(morph_stack, cents):
+            dy = float(ref_cy - cy); dx = float(ref_cx - cx)
+            aligned.append(_shift2d_bilinear(img, dy, dx))
+        morph_stack = np.stack(aligned, axis=0)
+    return morph_stack
+
+def _apply_uniform_crop(morph_stack, uniform_crop):
+    """Center-crop each sample in the stack to uniform_crop = (h,w) or int."""
+    if uniform_crop is None or morph_stack.ndim != 3:
+        return morph_stack
+    if isinstance(uniform_crop, int):
+        target_shape = (uniform_crop, uniform_crop)
+    else:
+        target_shape = tuple(uniform_crop)
+    return np.stack([_central_crop(img, target_shape) for img in morph_stack], axis=0)
+
+def _posterior_residual_mean(obs, scene, samples):
+    """Render posterior-mean scene and return mean residual over channels in obs frame."""
+    import copy as _copy
+    post_scene = _copy.deepcopy(scene)
+    for j, s in enumerate(post_scene.sources):
+        key_c = f"center:{j}"
+        if key_c in samples:
+            s.center = np.asarray(samples[key_c]).mean(axis=0)
+        key_s = f"spectrum:{j}"
+        if key_s in samples:
+            s.spectrum = np.asarray(samples[key_s]).mean(axis=0)
+        key_m = f"morph:{j}"
+        key_sz = f"size:{j}"
+        key_el = f"ellipticity:{j}"
+        if key_m in samples:
+            s.morphology = np.asarray(samples[key_m]).mean(axis=0)
+        elif key_sz in samples and key_el in samples:
+            mean_sz = float(np.asarray(samples[key_sz]).mean(axis=0))
+            mean_el = np.asarray(samples[key_el]).mean(axis=0)
+            try:
+                s.morphology.size = mean_sz
+                s.morphology.ellipticity = mean_el
+            except Exception:
+                s.morphology = GaussianMorphology(mean_sz, mean_el, shape=(s.bbox.shape[-2], s.bbox.shape[-1]))
+    model_post = obs.render(post_scene())
+    residual_cube = obs.data - model_post
+    return residual_cube.mean(axis=0)
+
+def _crop_residual_to_src(residual2d, src_obj, scene, obs):
+    """Crop a 2D residual map (obs frame) to the bbox of src_obj, returning a (H,W) patch."""
+    start_yx = np.array(src_obj.bbox.spatial.start, dtype=float)
+    stop_yx  = np.array(src_obj.bbox.spatial.stop,  dtype=float)
+    start_xy = start_yx[::-1]; stop_xy = stop_yx[::-1]
+    start_sky = scene.frame.get_sky_coord(start_xy).flatten()
+    stop_sky  = scene.frame.get_sky_coord(stop_xy).flatten()
+    start_xy_obs = obs.frame.get_pixel(start_sky).flatten()
+    stop_xy_obs  = obs.frame.get_pixel(stop_sky).flatten()
+    x0 = int(np.clip(np.floor(min(start_xy_obs[0], stop_xy_obs[0])), 0, residual2d.shape[1]))
+    x1 = int(np.clip(np.ceil( max(start_xy_obs[0], stop_xy_obs[0])),  0, residual2d.shape[1]))
+    y0 = int(np.clip(np.floor(min(start_xy_obs[1], stop_xy_obs[1])), 0, residual2d.shape[0]))
+    y1 = int(np.clip(np.ceil( max(start_xy_obs[1], stop_xy_obs[1])),  0, residual2d.shape[0]))
+    patch = residual2d[y0:y1, x0:x1]
+    H, W = src_obj.bbox.shape[-2], src_obj.bbox.shape[-1]
+    if patch.shape != (H, W):
+        ph, pw = patch.shape
+        pad_y = max(0, H - ph); pad_x = max(0, W - pw)
+        if pad_y or pad_x:
+            patch = np.pad(patch, ((pad_y//2, pad_y - pad_y//2), (pad_x//2, pad_x - pad_x//2)), mode="constant")
+        if patch.shape[0] > H or patch.shape[1] > W:
+            patch = _central_crop(patch, (H, W))
+    return patch
+
+def _compute_norms(morph_means, morph_stds):
+    """Build global Normalize objects from lists of mean/std images (robust percentiles)."""
+    all_mean_pixels = np.concatenate([m.ravel() for m in morph_means]) if morph_means else np.array([0.0])
+    all_std_pixels  = np.concatenate([s.ravel() for s in morph_stds])  if morph_stds  else np.array([0.0])
+    mean_norm = Normalize(vmin=np.percentile(all_mean_pixels, 2), vmax=np.percentile(all_mean_pixels, 98))
+    std_norm  = Normalize(vmin=0.0, vmax=np.percentile(all_std_pixels, 98))
+    return mean_norm, std_norm
+
+def _plot_source_row(ax_row, i, mean_img, std_img, spec_samples,
+                     resid_patch, mean_norm, std_norm, channels, center_samples=None):
+    """Plot one row: mean, std, spectrum, center trace, residual patch."""
+    ax_mean, ax_std, ax_spec, ax_ctr, ax_resid = ax_row
+    im0 = ax_mean.imshow(mean_img, origin='lower', norm=mean_norm)
+    im1 = ax_std.imshow(std_img, origin='lower', cmap='magma', norm=std_norm)
+    ax_mean.set_title(f"Source {i} mean", fontsize=10)
+    ax_std.set_title(f"Source {i} std", fontsize=10)
+
+    for ax in (ax_mean, ax_std):
+        ax.set_aspect('equal'); ax.tick_params(labelsize=8, length=2)
+        ax.set_xlabel("x [pix]", fontsize=8); ax.set_ylabel("y [pix]", fontsize=8)
+
+    # Spectrum
+    if spec_samples is not None and len(spec_samples) > 0:
+        spec = np.asarray(spec_samples)
+        mu, sig = spec.mean(axis=0), spec.std(axis=0)
+        x = np.arange(mu.size)
+        ax_spec.plot(x, mu, '-o', markersize=3)
+        ax_spec.fill_between(x, mu - sig, mu + sig, alpha=0.25, linewidth=0)
+        ymax = float(np.max(mu + sig)) if mu.size else 1.0
+        ax_spec.set_ylim(0, 1.05*ymax)
+        ax_spec.set_xticks(x)
+        if channels is not None and len(channels) == mu.size:
+            ax_spec.set_xticklabels(channels, rotation=0, fontsize=9)
+    ax_spec.tick_params(labelsize=9); ax_spec.grid(alpha=0.2, linestyle=':', linewidth=0.7)
+    ax_spec.set_title(f"Spectrum {i}", fontsize=10)
+    # Center trace
+    if center_samples is not None and len(center_samples) > 0:
+        ctr = np.asarray(center_samples)
+        ax_ctr.plot(ctr[:, 0], '.', ms=2, label='y');ax_ctr.plot(ctr[:, 1],  '.', ms=2, label='x')
+        if i == 0:
+            ax_ctr.legend(frameon=False, fontsize=9, loc='upper right')
+        ax_ctr.axhline(0, color='k', lw=0.8, alpha=0.4)
+    ax_ctr.set_title(f"Center {i}", fontsize=10); ax_ctr.tick_params(labelsize=9)
+    ax_ctr.grid(alpha=0.2, linestyle=':', linewidth=0.7)
+    # Residual
+    v = np.percentile(np.abs(resid_patch), 98) if np.isfinite(resid_patch).any() else 1.0
+    ax_resid.imshow(resid_patch, origin='lower', cmap='RdBu_r', vmin=-v, vmax=v)
+    ax_resid.set_title(f"Residual ⟨data−model⟩ {i}", fontsize=10)
+
+    ax_resid.set_aspect('equal'); ax_resid.tick_params(labelsize=8, length=2)
+    ax_resid.set_xlabel("x [pix]", fontsize=8); ax_resid.set_ylabel("y [pix]", fontsize=8)
+
+    return im0, im1
+
+
+def mcmc_diagnostics(obs, scene, samples, centers, figsize=(10, 2.6),
+                     recenter=True, 
+                     uniform_crop=None):
+    """
+    For each source (row):
+      [0] morphology mean   [1] morphology std   [2] spectrum (mean ± 1σ)   [3] center trace   [4] residual
+
+    Parameters
+    ----------
+    obs : scarlet2.Observation
+        The observation object.
+    scene : scarlet2.Scene
+        The scene object.
+    mcmc : numpyro.infer.MCMC
+        The MCMC samples.
+    centers : list
+        List of centers for each source.
+    figsize : tuple, optional
+        Figure size.
+    recenter : bool, optional
+        Whether to recenter morphologies.
+    uniform_crop : tuple or int, optional
+        Uniform crop size.
+    """
+    nsrc = len(scene.sources)
+    ncols = 5
+
+    # Build stacks → align → optional crop → collect mean/std
+    morph_means, morph_stds = [], []
+    for i, src in enumerate(scene.sources):
+        stack = _get_morph_stack(i, src, samples, obs, scene)
+        if recenter:
+            stack = _align_morph_stack(stack, i, samples)
+        stack = _apply_uniform_crop(stack, uniform_crop)
+        morph_means.append(stack.mean(axis=0))
+        morph_stds.append(stack.std(axis=0))
+
+    # Posterior-mean residual map in obs frame
+    residual_mean_global = _posterior_residual_mean(obs, scene, samples)
+
+    # Global color norms
+    mean_norm, std_norm = _compute_norms(morph_means, morph_stds)
+
+    # Figure & axes
+    fig, axes = plt.subplots(
+        nsrc, ncols,
+        figsize=(figsize[0]*ncols, figsize[1]*nsrc),
+        constrained_layout=True,
+        gridspec_kw={'wspace': 0.05, 'hspace': 0.05,
+                     'width_ratios': [1, 1, 1.2, 1.4, 1.2]}
+    )
+    if nsrc == 1:
+        axes = axes[np.newaxis, :]
+
+    im_mean_refs, im_std_refs = [], []
+    for i in range(nsrc):
+        if f"center:{i}" in samples.keys():
+            center_samples=(np.asarray(samples.get(f"center:{i}", None)) - np.asarray(centers[i]))
+        else:
+            center_samples=(np.ones((len(samples),2)) - np.asarray(centers[i]))
+        resid_patch = _crop_residual_to_src(residual_mean_global, scene.sources[i], scene, obs)
+        im0, im1 = _plot_source_row(
+            axes[i], i,
+            morph_means[i], morph_stds[i],
+            samples.get(f"spectrum:{i}", None),
+            resid_patch, mean_norm, std_norm, scene.frame.channels,
+            center_samples=center_samples,
+        )
+        im_mean_refs.append(im0); im_std_refs.append(im1)
+
+    # Colorbars
+    fig.colorbar(im_mean_refs[0], ax=axes[:, 0], fraction=1, pad=0.15)
+    fig.colorbar(im_std_refs[0],  ax=axes[:, 1], fraction=1, pad=0.15)
+
+
+    # Link zoom
+    for r in range(nsrc):
+        axes[r, 1].sharex(axes[r, 0]); axes[r, 1].sharey(axes[r, 0])
+
+    plt.show()
+    return fig, axes
+
+def corner_centers_spectra(samples, scene, sources=None, channels="all", thin=1, max_samples=5000):
+    """
+    Corner plot of centers and spectra for selected sources.
+
+    Parameters
+    ----------
+    mcmc : numpyro.infer.MCMC
+        The MCMC object returned by scene.sample(...).
+    scene : scarlet2.Scene
+        Scene (for channel names and source count).
+    sources : list[int] or None
+        Which sources to include. None = all.
+    channels : "all" | list[int]
+        Which spectral channels to include. "all" uses all.
+    thin : int
+        Take every `thin`-th sample.
+    max_samples : int
+        Randomly subsample to at most this many rows (after thinning).
+    """
+    nsrc = len(scene.sources)
+    if sources is None:
+        sources = list(range(nsrc))
+    if channels == "all":
+        C = scene.frame.C
+        chan_idx = list(range(C))
+    else:
+        chan_idx = list(channels)
+
+    cols = []
+    labels = []
+
+    # Build columns
+    for i in sources:
+        # centers
+        key_c = f"center:{i}"
+        if key_c in samples:
+            Ci = np.asarray(samples[key_c])[::thin]
+            cols.append(Ci[:, 0]); labels.append(f"S{i}: center_dy")
+            cols.append(Ci[:, 1]); labels.append(f"S{i}: center_dx")
+        # spectra
+        key_s = f"spectrum:{i}"
+        if key_s in samples:
+            Si = np.asarray(samples[key_s])[::thin]
+            # choose channels
+            for k in chan_idx:
+                if k < Si.shape[1]:
+                    lab_ch = scene.frame.channels[k] if scene.frame.channels else k
+                    cols.append(Si[:, k]); labels.append(f"S{i}: spec[{lab_ch}]")
+
+    if not cols:
+        raise ValueError("No center: or spectrum: samples found for requested sources.")
+
+    # Align lengths + stack
+    # (some arrays may differ in length if keys missing for some sources)
+    min_len = min(len(c) for c in cols)
+    cols = [c[:min_len] for c in cols]
+    X = np.vstack(cols).T  # (Nsamples, D)
+
+    # Subsample if huge
+    if len(X) > max_samples:
+        idx = np.random.choice(len(X), size=max_samples, replace=False)
+        X = X[idx]
+
+    fig = corner.corner(
+        X,
+        labels=labels,
+        show_titles=True,
+        title_fmt=".3g",
+        quantiles=[0.16, 0.5, 0.84],
+        plot_datapoints=False,
+        smooth=0.9,
+        bins=30,
+        label_kwargs={"fontsize": 9},
+        title_kwargs={"fontsize": 9},
+    )
+    plt.show()
+    return fig

@@ -2,7 +2,7 @@
 
 import os
 import pickle
-
+import json
 import h5py
 import numpy as np
 
@@ -85,3 +85,72 @@ def model_from_h5(filename, id=0, path="."):
     f.close()
 
     return scene
+
+
+def save_session_h5(filename, scene, obs, mcmc, id=0, path=".", overwrite=False):
+    if not os.path.exists(path):
+        os.makedirs(path)
+    save_h5_path = os.path.join(path, filename)
+    group_name = str(id)
+
+    samples = mcmc.get_samples(group_by_chain=False)
+
+    with h5py.File(save_h5_path, "a") as f:
+        if group_name in f:
+            if overwrite:
+                del f[group_name]
+            else:
+                raise ValueError(f"ID {id} already exists. Set overwrite=True to replace it.")
+            
+        g = f.create_group(group_name)
+
+        scene_blob = pickle.dumps(scene, protocol=pickle.HIGHEST_PROTOCOL)
+        obs_blob   = pickle.dumps(obs,   protocol=pickle.HIGHEST_PROTOCOL)
+        g.create_dataset(
+            "scene_pickle",
+            data=np.frombuffer(scene_blob, dtype="uint8"),
+            compression="gzip", compression_opts=4, shuffle=True, fletcher32=True
+        )
+        g.create_dataset(
+            "obs_pickle",
+            data=np.frombuffer(obs_blob, dtype="uint8"),
+            compression="gzip", compression_opts=4, shuffle=True, fletcher32=True
+        )
+
+        gs = g.create_group("samples")
+        for k, v in samples.items():
+            dsname = str(k).replace("/", "_")
+            gs.create_dataset(
+                dsname, data=np.asarray(v),
+                compression="gzip", compression_opts=4, shuffle=True, fletcher32=True
+            )
+        try:
+            centers = [[float(c) for c in np.array(getattr(src, "center", (np.nan, np.nan)))] for src in scene.sources]
+        except Exception:
+            centers = None
+        g.attrs["meta"] = json.dumps({
+            "centers": centers,
+            "channels": getattr(scene.frame, "channels", None),
+        })
+        
+def load_session_h5(filename, id=0, path="."):
+    load_h5_path = os.path.join(path, filename)
+    group_name = str(id)
+    with h5py.File(load_h5_path, "r") as f:
+        if group_name not in f:
+            raise ValueError(f"ID {id} not found in file.")
+        g = f[group_name]
+
+        # --- READ FROM DATASETS ---
+        scene = pickle.loads(bytes(g["scene_pickle"][...]))
+        obs   = pickle.loads(bytes(g["obs_pickle"][...]))
+
+        samples = {}
+        if "samples" in g:
+            for k in g["samples"].keys():
+                samples[k] = np.array(g["samples"][k])
+        meta = {}
+        if "meta" in g.attrs:
+            meta = json.loads(g.attrs["meta"])
+        
+        return scene, obs, samples, meta
