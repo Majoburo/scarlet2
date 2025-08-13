@@ -44,14 +44,14 @@ def main(seed=1701):
 
     true_bkg_center = jnp.array([20, 20])
     true_bkg_size   = 8.0
-    true_bkg_ell    = jnp.array([0.5, 0.2])
+    true_bkg_ell    = jnp.array([0.1,0.1])
     true_bkg_spec   = jnp.array([120.0, 900.0, 5000.0, 20005.0])
 
     with Scene(model_frame) as sim_scene:
         point_morph = model_frame.psf.morphology
         Source(true_center, true_spectrum, point_morph)
         bkg_morph_true = GaussianMorphology(size=true_bkg_size,
-                                            ellipticity=true_bkg_ell,
+                                            #ellipticity=true_bkg_ell,
                                             shape=(H, W))
         Source(true_bkg_center, true_bkg_spec, bkg_morph_true)
 
@@ -146,7 +146,10 @@ def main(seed=1701):
         num_samples=10000,
         progress_bar=True,
     )
-    save_session_h5("obj_blend.h5", scene, obs, mcmc, id=0, path="runs", overwrite=True)
+    save_session_h5("obj_blend.h5", scene, obs, mcmc, id=0, path="runs", 
+                    spectra=jnp.stack((true_spectrum,true_bkg_spec)),
+                    centers=jnp.stack((true_center,true_bkg_center)),
+                    overwrite=True)
 
 
 if __name__ == "__main__":

@@ -79,6 +79,7 @@ class Component(Module):
             if isinstance(self.morphology, Module)
             else self.morphology
         )
+        morph/=morph.sum()
         return spectrum[:, None, None] * morph[None, :, :]
 
 

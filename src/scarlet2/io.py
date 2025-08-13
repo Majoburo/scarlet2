@@ -87,7 +87,7 @@ def model_from_h5(filename, id=0, path="."):
     return scene
 
 
-def save_session_h5(filename, scene, obs, mcmc, id=0, path=".", overwrite=False):
+def save_session_h5(filename, scene, obs, mcmc, id=0, path=".", spectra = None, centers= None, overwrite=False):
     if not os.path.exists(path):
         os.makedirs(path)
     save_h5_path = os.path.join(path, filename)
@@ -124,12 +124,10 @@ def save_session_h5(filename, scene, obs, mcmc, id=0, path=".", overwrite=False)
                 dsname, data=np.asarray(v),
                 compression="gzip", compression_opts=4, shuffle=True, fletcher32=True
             )
-        try:
-            centers = [[float(c) for c in np.array(getattr(src, "center", (np.nan, np.nan)))] for src in scene.sources]
-        except Exception:
-            centers = None
+            
         g.attrs["meta"] = json.dumps({
-            "centers": centers,
+            "centers": centers.tolist(),
+            "spectra": spectra.tolist(),
             "channels": getattr(scene.frame, "channels", None),
         })
         
