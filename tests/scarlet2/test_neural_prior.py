@@ -7,6 +7,17 @@ import equinox as eqx
 from scarlet2 import Observation, ArrayPSF, Frame, Scene, Source, Parameter, Box, relative_step, GaussianPSF, init
 from scarlet2.morphology import GaussianMorphology
 from scarlet2.io import save_session_h5
+# load in the model you wish to use
+from galaxygrad import get_prior
+from scarlet2.nn import ScorePrior
+
+# instantiate the prior class
+temp = 2e-2  # values in the range of [1e-3, 1e-1] produce good results
+prior32 = get_prior("hsc32")
+prior64 = get_prior("hsc64")
+prior32 = ScorePrior(prior32, prior32.shape(), t=temp)
+prior64 = ScorePrior(prior64, prior64.shape(), t=temp)
+
 
 def center_pad_to_shape(arr, target_shape):
     """Center-pad a 2D array `arr` to `target_shape` = (ty, tx) with zeros."""
@@ -28,10 +39,12 @@ def main(seed=1701):
     C, H, W = 4, 50, 50
     channels = [f"ch{i+1}" for i in range(C)]
 
+    # True source (model frame)
     true_center = jnp.array([25.3, 24.7])             # subpixel (y, x)
     true_spectrum = jnp.array([887.7139, 7800.6488, 4630.8484, 200.988321])
 
-    model_psf = GaussianPSF(0.3)
+    # Model-frame PSF: small so PSF transfer is handled by rendering
+    model_psf = GaussianPSF(0.30)
     obs_sigmas = [(i + 1) for i in range(C)]  # 1, 2, 3, 4 px
     kernels = []
     for s in obs_sigmas:
@@ -40,20 +53,25 @@ def main(seed=1701):
         kernels.append(k)
     obs_psf = ArrayPSF(jnp.stack(kernels, 0))
 
+    # ----- frames -----
     model_frame = Frame(Box((C, H, W)), channels=channels, psf=model_psf)
 
-    true_bkg_center = jnp.array([20, 20])
-    true_bkg_size   = 8.0
-    true_bkg_ell    = jnp.array([0.5, 0.2])
-    true_bkg_spec   = jnp.array([120.0, 900.0, 5000.0, 20005.0])
+    # ----- SIMULATION SCENE (truth): point source + big Gaussian background -----
+    true_bkg_center = jnp.array([20, 20])                    # blended with the point source
+    true_bkg_size   = 8.0                            # pixels (broad background blob)
+    true_bkg_ell    = jnp.array([0.05, -0.02])      # mild ellipticity (e1,e2)
+    true_bkg_spec   = jnp.array([120.0, 900.0, 5000.0, 20005.0])  # per-channel flux
 
     with Scene(model_frame) as sim_scene:
-        point_morph = model_frame.psf.morphology
+        point_morph = model_frame.psf.morphology     # supports subpixel shift via delta_center
         Source(true_center, true_spectrum, point_morph)
+        # Big Gaussian background morphology (unit area not enforced)
         bkg_morph_true = GaussianMorphology(size=true_bkg_size,
                                             ellipticity=true_bkg_ell,
                                             shape=(H, W))
         Source(true_bkg_center, true_bkg_spec, bkg_morph_true)
+
+    # ----- make an observation object -----
 
     obs = Observation(
         data=jnp.zeros((C, H, W), dtype=jnp.float32),
@@ -62,8 +80,11 @@ def main(seed=1701):
         channels=channels
     )
 
-    obs = obs.match(sim_scene.frame)        
-    model_obs = obs.render(sim_scene())
+    # ----- render noiseless model into observation frame -----
+    obs = obs.match(sim_scene.frame)        # build renderer chain (PSF transfer, etc.)
+    model_obs = obs.render(sim_scene())     # (C, H, W)
+
+    # ----- add Gaussian noise from weights -----
     read_noise_e = 2
     var = model_obs + (float(read_noise_e) ** 2)
     key = jax.random.PRNGKey(seed)
@@ -76,18 +97,20 @@ def main(seed=1701):
 
     # ----- FIT SCENE (initialize from helpers; will sample morphology of background) -----
     with Scene(model_frame) as scene:
+        # Source 0 (point): pixel-spectrum + compact morphology
         spec0_init = init.pixel_spectrum(obs, true_center, correct_psf=True)
         morph0_init = init.compact_morphology()
         Source(true_center, spec0_init, morph0_init)
 
+        # Source 1 (background): initialize spectrum + morphology from Gaussian moments
+        # Center is fixed (we will not sample it)
         spec1_init, morph1_init = init.from_gaussian_moments(
             obs,
             true_bkg_center,
-            box_sizes=[21, 31, 41, 51, 61],
+            box_sizes=[41, 51, 61],
             min_snr=10,
             min_corr=0.95,
         )
-        morph1_init = GaussianMorphology.from_image(morph1_init)
         Source(true_bkg_center, spec1_init, morph1_init)
 
     # ----- set up sampling over parameters -----
@@ -118,36 +141,23 @@ def main(seed=1701):
         stepsize=partial(relative_step, factor=0.05),
     )
 
-    # Morphology priors for background: "neural" if available, else moments-based fallback
-    init_size = getattr(scene.sources[1].morphology, "size", jnp.array(8.0))
-    init_ell  = getattr(scene.sources[1].morphology, "ellipticity", jnp.array([0.0, 0.0]))
-
-    prior_size = dist.LogNormal(loc=jnp.log(jnp.asarray(init_size)), scale=0.3)
-    prior_ell  = dist.MultivariateNormal(loc=jnp.asarray(init_ell), covariance_matrix=jnp.diag(jnp.array([0.2, 0.2])**2))
-
+    morph_step = partial(relative_step, factor=1e-3)
     parameters += Parameter(
-        scene.sources[1].morphology.size,
-        name="size:1",
-        prior=prior_size,
-        stepsize=partial(relative_step, factor=0.05),
-    )
-    parameters += Parameter(
-        scene.sources[1].morphology.ellipticity,
-        name="ellipticity:1",
-        prior=prior_ell,
-        stepsize=0.02,
+        scene.sources[1].morphology,
+        name=f"morph:1",
+        prior=prior64,
+        stepsize = morph_step
     )
 
     # ----- run sampler -----
     mcmc = scene.sample(
         obs,
         parameters,
-        num_warmup=2000,
-        num_samples=10000,
+        num_warmup=100,
+        num_samples=1000,
         progress_bar=True,
     )
-    save_session_h5("obj_blend.h5", scene, obs, mcmc, id=0, path="runs", overwrite=True)
-
+    save_session_h5("obj_neural.h5", scene, obs, mcmc, id=0, path="runs", overwrite=True)
 
 if __name__ == "__main__":
     main()

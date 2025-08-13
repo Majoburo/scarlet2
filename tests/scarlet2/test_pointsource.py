@@ -1,7 +1,5 @@
 import jax
 import jax.numpy as jnp
-import numpy as np
-import matplotlib.pyplot as plt
 from functools import partial
 import numpyro.distributions as dist
 import equinox as eqx
@@ -24,10 +22,6 @@ def center_pad_to_shape(arr, target_shape):
     pad_left = pad_x // 2
     pad_right = pad_x - pad_left
     return jnp.pad(arr, [(pad_top, pad_bottom), (pad_left, pad_right)], mode='constant', constant_values=0)
-
-def summarize(samples, key):
-    q16, q50, q84 = np.percentile(np.asarray(samples[key]), [16, 50, 84], axis=0)
-    return q50, (q84 - q16) / 2, q16, q84
 
 def main(seed=1701):
     # ----- configuration -----
@@ -105,32 +99,7 @@ def main(seed=1701):
         num_samples=10000,
         progress_bar=True,
     )
-    save_session_h5("obj.h5", scene, obs, mcmc, id=0, path="runs", overwrite=True)
-
-    samples = mcmc.get_samples()
-
-    c50, cerr, c16, c84 = summarize(samples, "center:0")
-    s50, serr, s16, s84 = summarize(samples, "spectrum:0")
-
-    print("\n=== Recovery ===")
-    print(f"True center       : {np.array(true_center)}")
-    print(f"Posterior center  : {c50}  (± {cerr})  68%: [{c16}, {c84}]")
-    print(f"\nTrue spectrum     : {np.array(true_spectrum)}")
-    print(f"Posterior spectrum: {s50}\n  68%: [{s16}, {s84}]")
-    plt.plot(true_spectrum)
-    plt.plot(s50)
-    plt.show()
-
-    # ----- quick diagnostic figure -----
-    fig, axes = plt.subplots(1, 3, figsize=(11, 3.8), constrained_layout=True)
-    axes[0].imshow(jnp.mean(obs.data, axis=0), origin="lower");     axes[0].set_title("Data (mean over C)")
-    axes[1].imshow(jnp.mean(model_obs, axis=0), origin="lower");    axes[1].set_title("Model (mean over C)")
-    resid = (obs.data - model_obs)
-    w = obs.weights
-    z = jnp.where(w.sum(axis=0) > 0, (w * resid).sum(axis=0) / jnp.sqrt(w.sum(axis=0)), 0.0)
-    axes[2].imshow(z, origin="lower", cmap="RdBu_r");              axes[2].set_title("Standardized residual z")
-    for ax in axes: ax.set_xticks([]); ax.set_yticks([])
-    plt.show()
+    save_session_h5("obj_ptsrc.h5", scene, obs, mcmc, id=0, path="runs", overwrite=True)
 
 if __name__ == "__main__":
     main()
