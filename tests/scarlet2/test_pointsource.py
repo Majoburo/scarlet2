@@ -99,7 +99,10 @@ def main(seed=1701):
         num_samples=10000,
         progress_bar=True,
     )
-    save_session_h5("obj_ptsrc.h5", scene, obs, mcmc, id=0, path="runs", overwrite=True)
+    save_session_h5("obj_ptsrc.h5", scene, obs, mcmc, id=0, path="runs",
+                    spectra=[true_spectrum.tolist()],
+                    centers=[true_center.tolist()],
+                    overwrite=True)
 
 if __name__ == "__main__":
     main()

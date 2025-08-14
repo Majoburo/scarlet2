@@ -147,8 +147,8 @@ def main(seed=1701):
         progress_bar=True,
     )
     save_session_h5("obj_blend.h5", scene, obs, mcmc, id=0, path="runs", 
-                    spectra=jnp.stack((true_spectrum,true_bkg_spec)),
-                    centers=jnp.stack((true_center,true_bkg_center)),
+                    spectra=jnp.stack((true_spectrum,true_bkg_spec)).tolist(),
+                    centers=jnp.stack((true_center,true_bkg_center)).tolist(),
                     overwrite=True)
 
 
