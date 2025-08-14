@@ -256,6 +256,11 @@ class Moments(dict):
         """
         ellipticity = (self[0, 2] - self[2, 0] + 2j * self[1, 1]) / (self[2, 0] + self[0, 2])
         return jnp.array((ellipticity.real, ellipticity.imag))
+    
+    
+
+
+
 
     def deconvolve(self, p):
         """Deconvolve moments from moments `p`

@@ -126,8 +126,8 @@ def save_session_h5(filename, scene, obs, mcmc, id=0, path=".", spectra = None, 
             )
             
         g.attrs["meta"] = json.dumps({
-            "centers": centers.tolist(),
-            "spectra": spectra.tolist(),
+            "centers": centers,
+            "spectra": spectra,
             "channels": getattr(scene.frame, "channels", None),
         })
         
